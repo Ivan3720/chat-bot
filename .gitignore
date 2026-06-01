@@ -1,0 +1,27 @@
+# Секретные данные
+.env
+admins.json
+
+# Виртуальное окружение
+venv/
+.venv/
+env/
+
+# Python-кэш
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Системные файлы macOS
+.DS_Store
+._*
+
+# Логи и временные файлы
+*.log
+tmp/
+temp/
+
+# Временные файлы Excel
+~$*.xlsx
+~$*.xls

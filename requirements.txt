@@ -1,0 +1,7 @@
+vk_api
+pandas
+openpyxl
+xlrd
+requests
+python-dotenv
+reportlab
