@@ -2,6 +2,10 @@ import json
 import os
 import random
 import re
+import shutil
+import tempfile
+import zipfile
+from datetime import datetime
 from urllib.parse import urlparse
 
 import requests
@@ -21,6 +25,8 @@ load_dotenv()
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 BASE_CARDS_DIR = os.path.abspath(os.path.join(BASE_DIR, "cards"))
+EXAMPLE_FILES_DIR = os.path.join(BASE_DIR, "tech_card_examples")
+EXAMPLE_TECH_CARD_FILENAME = "Смузи клубника-банан 0,3.xlsx"
 
 TOKEN = os.getenv("VK_TOKEN")
 if not TOKEN:
@@ -39,7 +45,7 @@ if not ADMIN_SECRET:
 
 ADMIN_ACCESS_WORD = os.getenv("ADMIN_ACCESS_WORD", "admin_007").strip().lower()
 ADMIN_IDS_FILE = os.path.join(BASE_DIR, "admins.json")
-ALLOWED_CARD_EXTENSIONS = {".xlsx", ".xls", ".csv"}
+ALLOWED_CARD_EXTENSIONS = {".xlsx"}
 MAX_UPLOAD_SIZE = int(os.getenv("MAX_UPLOAD_SIZE", str(20 * 1024 * 1024)))
 
 # Хранилище ID сообщений для очистки чата
@@ -179,11 +185,21 @@ def create_admin_keyboard():
             {"action": {"type": "text", "label": "🗑 Удалить техкарту"}, "color": "negative"},
         ],
         [
+            {"action": {"type": "text", "label": "📂 Создать папку"}, "color": "positive"},
+            {"action": {"type": "text", "label": "🗂 Удалить папку"}, "color": "negative"},
+        ],
+        [
+            {"action": {"type": "text", "label": "📘 Как оформить техкарту"}, "color": "primary"},
             {"action": {"type": "text", "label": "📁 Папки техкарт"}, "color": "primary"},
+        ],
+        [
+            {"action": {"type": "text", "label": "📦 Скачать все техкарты ZIP"}, "color": "secondary"},
             {"action": {"type": "text", "label": "🔄 Обновить базу"}, "color": "primary"},
         ],
         [
             {"action": {"type": "text", "label": "👥 Список админов"}, "color": "secondary"},
+        ],
+        [
             {"action": {"type": "text", "label": "🏠 В начало"}, "color": "secondary"},
         ],
     ]
@@ -191,9 +207,13 @@ def create_admin_keyboard():
 
 
 def create_admin_folders_keyboard(folders, current_path, mode):
-    """Клавиатура выбора папки для загрузки/удаления."""
+    """Клавиатура выбора папки для загрузки/удаления/создания."""
     buttons = []
-    for folder in folders[:8]:
+    if mode in {"create", "delete_dir"}:
+        folders_limit = 9 if current_path == "cards" else 8
+    else:
+        folders_limit = 8
+    for folder in folders[:folders_limit]:
         buttons.append(
             [{"action": {"type": "text", "label": folder[:40]}, "color": "positive"}]
         )
@@ -218,6 +238,25 @@ def create_admin_folders_keyboard(folders, current_path, mode):
                     }
                 ]
             )
+        if mode == "delete_dir":
+            buttons.append(
+                [
+                    {
+                        "action": {"type": "text", "label": "🗑 Удалить эту папку"},
+                        "color": "negative",
+                    }
+                ]
+            )
+
+    if mode == "create":
+        buttons.append(
+            [
+                {
+                    "action": {"type": "text", "label": "➕ Создать здесь"},
+                    "color": "primary",
+                }
+            ]
+        )
 
     buttons.append(
         [
@@ -228,6 +267,24 @@ def create_admin_folders_keyboard(folders, current_path, mode):
     return json.dumps({"one_time": False, "buttons": buttons[:10]}, ensure_ascii=False)
 
 
+def get_admin_subfolders(path="cards"):
+    """Возвращает реальные подпапки для админки.
+
+    Здесь специально не используем обычный get_subfolders(), потому что он
+    скрывает некоторые разделы в пользовательском меню. В админке нужно видеть
+    все папки, даже пустые, чтобы их можно было удалить или выбрать для загрузки.
+    """
+    path = ensure_safe_cards_path(path)
+    if not os.path.exists(path):
+        return []
+
+    return sorted(
+        name
+        for name in os.listdir(path)
+        if os.path.isdir(os.path.join(path, name)) and name != "__MACOSX"
+    )
+
+
 def sanitize_filename(filename):
     """Убирает опасные символы из имени загружаемого файла."""
     filename = os.path.basename(filename)
@@ -235,6 +292,228 @@ def sanitize_filename(filename):
     filename = filename.strip()
     return filename or "tech_card.xlsx"
 
+def sanitize_folder_name(folder_name):
+    """Убирает опасные символы из названия создаваемой папки."""
+    folder_name = str(folder_name).strip()
+    folder_name = re.sub(r"[\\/:*?\"<>|]+", "_", folder_name)
+    folder_name = " ".join(folder_name.split())
+    folder_name = folder_name.strip(" .")
+
+    if not folder_name:
+        raise ValueError("Название папки не может быть пустым")
+    if folder_name in {".", ".."}:
+        raise ValueError("Такое название папки использовать нельзя")
+    if folder_name == "__MACOSX":
+        raise ValueError("Такое название папки зарезервировано")
+
+    return folder_name[:60]
+
+
+def create_folder_in_cards(parent_path, folder_name):
+    """Создаёт новую папку внутри cards и не даёт выйти за пределы cards."""
+    parent_path = ensure_safe_cards_path(parent_path)
+    safe_name = sanitize_folder_name(folder_name)
+    target_path = ensure_safe_cards_path(os.path.join(parent_path, safe_name))
+
+    if os.path.exists(target_path):
+        raise ValueError("Такая папка уже существует")
+
+    os.makedirs(target_path, exist_ok=False)
+    return target_path
+
+
+
+def get_folder_delete_summary(folder_path):
+    """Считает, что будет удалено вместе с папкой."""
+    folder_path = ensure_safe_cards_path(folder_path)
+    files_count = 0
+    dirs_count = 0
+
+    for _root, dirs, files in os.walk(folder_path):
+        dirs[:] = [d for d in dirs if d != "__MACOSX"]
+        dirs_count += len(dirs)
+        files_count += len(files)
+
+    return files_count, dirs_count
+
+
+def delete_folder_from_cards(folder_path):
+    """Удаляет выбранную папку внутри cards вместе с содержимым."""
+    folder_path = ensure_safe_cards_path(folder_path)
+
+    if folder_path == BASE_CARDS_DIR:
+        raise ValueError("Нельзя удалить корневую папку cards")
+    if not os.path.isdir(folder_path):
+        raise ValueError("Папка уже не найдена")
+
+    shutil.rmtree(folder_path)
+    return folder_path
+
+
+def get_tech_card_format_help():
+    """Возвращает инструкцию для администратора по оформлению техкарты."""
+    return (
+        "📘 Как правильно оформить техкарту\n\n"
+        "Принимаются файлы только в формате .xlsx.\n"
+        "Файл нужно отправлять именно как документ VK, не фотографией и не текстом.\n"
+        "Бот читает таблицу по строке с заголовками: «Наименование», «Ед изм», «Нетто».\n\n"
+        "Обязательная структура файла:\n"
+        "1. Вверху укажите название позиции: в одной ячейке «Наименование», "
+        "а в соседней справа — название техкарты.\n"
+        "2. Ниже сделайте строку заголовков: «Наименование | Ед изм | Нетто».\n"
+        "3. Под заголовками перечислите ингредиенты.\n"
+        "4. В конце можно добавить строку «Выход» — бот покажет итоговый выход.\n\n"
+        "Пример техкарты: Смузи клубника-банан 0,3\n\n"
+        "Строка 1:\n"
+        "Наименование | Смузи клубника-банан 0,3\n\n"
+        "Строка 3 — заголовки таблицы:\n"
+        "Наименование | Ед изм | Нетто\n\n"
+        "Ниже ингредиенты:\n"
+        "Банан | г | 80\n"
+        "Клубника | г | 70\n"
+        "Сок яблочный | мл | 150\n"
+        "Сироп сахарный | мл | 10\n"
+        "Выход | мл | 300\n\n"
+        "Важно:\n"
+        "• не объединяйте ячейки в строке заголовков таблицы;\n"
+        "• колонка «Наименование» должна быть именно так подписана;\n"
+        "• колонка «Ед изм» нужна для единиц измерения;\n"
+        "• колонка «Нетто» нужна для количества;\n"
+        "• название файла может быть любым, но лучше назвать его как позицию;\n"
+        "• принимается именно .xlsx;\n"
+        "• ниже я прикреплю готовый .xlsx-файл для примера;\n"
+        "• после загрузки нажмите «🔄 Обновить базу»."
+    )
+
+
+
+
+def ensure_example_tech_card_file():
+    """Возвращает пример техкарты .xlsx из отдельной папки tech_card_examples.
+
+    Папка создаётся автоматически. Если старый пример лежит рядом с main.py,
+    бот перенесёт его в tech_card_examples, чтобы не хранить пример в корне проекта.
+    """
+    os.makedirs(EXAMPLE_FILES_DIR, exist_ok=True)
+
+    example_path = os.path.join(EXAMPLE_FILES_DIR, EXAMPLE_TECH_CARD_FILENAME)
+    if os.path.exists(example_path):
+        return example_path
+
+    # Мягкая миграция со старой схемы: пример раньше лежал рядом с main.py.
+    old_preferred_path = os.path.join(BASE_DIR, EXAMPLE_TECH_CARD_FILENAME)
+    if os.path.exists(old_preferred_path):
+        shutil.copy2(old_preferred_path, example_path)
+        return example_path
+
+    old_generic_path = os.path.join(BASE_DIR, "primer_tehkarty.xlsx")
+    if os.path.exists(old_generic_path):
+        shutil.copy2(old_generic_path, example_path)
+        return example_path
+
+    try:
+        from openpyxl import Workbook
+        from openpyxl.styles import Font, PatternFill, Alignment
+        from openpyxl.utils import get_column_letter
+    except Exception as error:
+        raise RuntimeError(
+            "Не получилось создать пример .xlsx. Установите openpyxl: pip install openpyxl"
+        ) from error
+
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "Пример техкарты"
+
+    rows = [
+        ["Наименование", "Смузи клубника-банан 0,3", ""],
+        ["", "", ""],
+        ["Наименование", "Ед изм", "Нетто"],
+        ["Банан", "г", 80],
+        ["Клубника", "г", 70],
+        ["Сок яблочный", "мл", 150],
+        ["Сироп сахарный", "мл", 10],
+        ["Выход", "мл", 300],
+    ]
+
+    for row in rows:
+        sheet.append(row)
+
+    header_fill = PatternFill("solid", fgColor="FFD966")
+    bold_font = Font(bold=True)
+
+    for cell in sheet[1]:
+        cell.font = bold_font
+        cell.fill = header_fill
+
+    for cell in sheet[3]:
+        cell.font = bold_font
+        cell.fill = header_fill
+        cell.alignment = Alignment(horizontal="center")
+
+    for column_cells in sheet.columns:
+        column_letter = get_column_letter(column_cells[0].column)
+        max_len = max(len(str(cell.value or "")) for cell in column_cells)
+        sheet.column_dimensions[column_letter].width = min(max(max_len + 3, 12), 35)
+
+    workbook.save(example_path)
+    return example_path
+
+def send_tech_card_format_help(vk, upload, user_id):
+    """Отправляет инструкцию по оформлению техкарты и прикрепляет пример .xlsx."""
+    send_msg(vk, user_id, get_tech_card_format_help())
+
+    try:
+        example_path = ensure_example_tech_card_file()
+        document = upload.document_message(
+            doc=example_path,
+            title="Пример техкарты.xlsx",
+            peer_id=user_id,
+        )
+        doc_info = document.get("doc", {})
+        attachment = f"doc{doc_info['owner_id']}_{doc_info['id']}"
+        send_msg(
+            vk,
+            user_id,
+            "📎 Прикрепил пример техкарты в формате .xlsx. Можно скачать файл, заменить название и ингредиенты, а потом загрузить через админку.",
+            keyboard=create_admin_keyboard(),
+            attachment=attachment,
+        )
+    except Exception as error:
+        print(f"Ошибка отправки примера техкарты: {error}")
+        send_msg(
+            vk,
+            user_id,
+            f"Инструкцию отправил, но пример .xlsx из папки tech_card_examples прикрепить не получилось: {error}",
+            keyboard=create_admin_keyboard(),
+        )
+
+
+def send_example_tech_card_file(vk, upload, user_id, keyboard=None):
+    """Прикрепляет администратору пример .xlsx без длинного пояснения."""
+    try:
+        example_path = ensure_example_tech_card_file()
+        document = upload.document_message(
+            doc=example_path,
+            title="Пример техкарты.xlsx",
+            peer_id=user_id,
+        )
+        doc_info = document.get("doc", {})
+        attachment = f"doc{doc_info['owner_id']}_{doc_info['id']}"
+        send_msg(
+            vk,
+            user_id,
+            "📎 Пример техкарты в формате .xlsx",
+            keyboard=keyboard,
+            attachment=attachment,
+        )
+    except Exception as error:
+        print(f"Ошибка отправки примера техкарты: {error}")
+        send_msg(
+            vk,
+            user_id,
+            f"Не получилось прикрепить пример .xlsx из папки tech_card_examples: {error}",
+            keyboard=keyboard,
+        )
 
 def is_safe_cards_path(path):
     """Проверяет, что путь находится строго внутри папки cards."""
@@ -264,6 +543,60 @@ def get_card_files_in_folder(folder_path):
     return files
 
 
+
+
+def parse_file_selection(text, total_count):
+    """Разбирает номера файлов для массового удаления.
+
+    Поддерживает форматы:
+    - 2
+    - 1, 3, 5
+    - 1 3 5
+    - 1-4
+    - все
+    """
+    text = (text or "").strip().lower().replace("ё", "е")
+    if text in {"все", "all", "*"}:
+        return list(range(total_count))
+
+    indexes = set()
+    parts = re.split(r"[\s,;]+", text)
+
+    for part in parts:
+        part = part.strip()
+        if not part:
+            continue
+
+        if "-" in part:
+            start_raw, end_raw = part.split("-", 1)
+            if not start_raw.isdigit() or not end_raw.isdigit():
+                raise ValueError("Используйте номера файлов, например: 1, 3, 5 или 1-4")
+
+            start = int(start_raw)
+            end = int(end_raw)
+            if start > end:
+                start, end = end, start
+
+            for number in range(start, end + 1):
+                if number < 1 or number > total_count:
+                    raise ValueError(f"Номера должны быть от 1 до {total_count}")
+                indexes.add(number - 1)
+            continue
+
+        if not part.isdigit():
+            raise ValueError("Используйте номера файлов, например: 1, 3, 5 или 1-4")
+
+        number = int(part)
+        if number < 1 or number > total_count:
+            raise ValueError(f"Номера должны быть от 1 до {total_count}")
+        indexes.add(number - 1)
+
+    if not indexes:
+        raise ValueError("Напишите хотя бы один номер файла.")
+
+    return sorted(indexes)
+
+
 def get_folder_tree_lines(root="cards"):
     """Формирует текстовое дерево папок cards."""
     root = ensure_safe_cards_path(root)
@@ -283,32 +616,225 @@ def get_folder_tree_lines(root="cards"):
     return lines
 
 
-def get_event_doc_info(vk, event):
-    """Достаёт информацию о документе из сообщения VK LongPoll."""
-    attachments = getattr(event, "attachments", {}) or {}
+def create_cards_zip_archive():
+    """Создаёт ZIP-архив всех техкарт из cards с сохранением структуры папок."""
+    cards_dir = ensure_safe_cards_path("cards")
+    if not os.path.isdir(cards_dir):
+        raise ValueError("Папка cards не найдена")
 
-    # В LongPoll часто приходит attach1_type=doc и attach1=owner_id_doc_id.
-    for key, value in attachments.items():
-        if key.endswith("_type") and value == "doc":
-            prefix = key[: -len("_type")]
-            doc_ref = attachments.get(prefix)
-            if doc_ref:
-                docs = vk.docs.getById(docs=doc_ref)
-                if docs:
-                    return docs[0]
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    temp_dir = tempfile.mkdtemp(prefix="vk_tech_cards_")
+    zip_path = os.path.join(temp_dir, f"tech_cards_{timestamp}.zip")
 
-    # Запасной вариант для другого формата attachments.
-    for value in attachments.values():
-        if isinstance(value, str) and "_" in value:
+    added_files = 0
+    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for current_root, dirs, files in os.walk(cards_dir):
+            dirs[:] = sorted(d for d in dirs if d != "__MACOSX")
+            for filename in sorted(files):
+                if filename.startswith("._") or filename == ".DS_Store":
+                    continue
+
+                file_path = os.path.join(current_root, filename)
+                if not os.path.isfile(file_path):
+                    continue
+
+                # В архив кладём путь начиная с cards/, чтобы сохранились все директории.
+                arcname = os.path.relpath(file_path, BASE_DIR)
+                archive.write(file_path, arcname)
+                added_files += 1
+
+    if added_files == 0:
+        try:
+            os.remove(zip_path)
+            os.rmdir(temp_dir)
+        except OSError:
+            pass
+        raise ValueError("В папке cards нет файлов для архивации")
+
+    return zip_path, added_files
+
+
+def send_cards_zip_archive(vk, upload, user_id):
+    """Отправляет администратору ZIP-архив всех техкарт."""
+    zip_path = None
+    temp_dir = None
+    try:
+        zip_path, files_count = create_cards_zip_archive()
+        temp_dir = os.path.dirname(zip_path)
+
+        document = upload.document_message(
+            doc=zip_path,
+            title="Все техкарты.zip",
+            peer_id=user_id,
+        )
+        doc_info = document.get("doc", {})
+        attachment = f"doc{doc_info['owner_id']}_{doc_info['id']}"
+        send_msg(
+            vk,
+            user_id,
+            f"📦 Архив техкарт готов. Файлов внутри: {files_count}.",
+            keyboard=create_admin_keyboard(),
+            attachment=attachment,
+        )
+    except Exception as error:
+        print(f"Ошибка отправки ZIP-архива техкарт: {error}")
+        send_msg(
+            vk,
+            user_id,
+            f"Не получилось отправить ZIP-архив: {error}",
+            keyboard=create_admin_keyboard(),
+        )
+    finally:
+        if zip_path and os.path.exists(zip_path):
             try:
-                docs = vk.docs.getById(docs=value)
-                if docs and docs[0].get("url"):
-                    return docs[0]
-            except Exception:
+                os.remove(zip_path)
+            except OSError:
+                pass
+        if temp_dir and os.path.isdir(temp_dir):
+            try:
+                os.rmdir(temp_dir)
+            except OSError:
                 pass
 
+
+def _normalize_vk_doc_ref(doc_ref):
+    """Приводит ссылку на документ VK к формату owner_id_doc_id[_access_key]."""
+    if not doc_ref:
+        return None
+
+    doc_ref = str(doc_ref).strip()
+    if doc_ref.startswith("doc"):
+        doc_ref = doc_ref[3:]
+
+    return doc_ref or None
+
+
+def _get_doc_by_ref(vk, doc_ref):
+    """Безопасно получает документ VK по строковой ссылке."""
+    doc_ref = _normalize_vk_doc_ref(doc_ref)
+    if not doc_ref:
+        return None
+
+    try:
+        docs = vk.docs.getById(docs=doc_ref)
+    except Exception as error:
+        print(f"Не удалось получить документ VK {doc_ref}: {error}")
+        return None
+
+    if docs:
+        return docs[0]
     return None
 
+
+def get_event_docs_info(vk, event):
+    """Достаёт все документы из сообщения VK LongPoll.
+
+    Админ может прислать сразу несколько .xlsx-файлов одним сообщением.
+    VK может отдавать вложения в разных форматах. Для документов из личных
+    сообщений часто нужен access_key, иначе docs.getById не возвращает URL
+    или падает с ошибкой доступа. Поэтому собираем все возможные варианты.
+    """
+    attachments = getattr(event, "attachments", {}) or {}
+    checked_refs = set()
+    docs_found = []
+    seen_docs = set()
+
+    def add_doc(doc):
+        if not doc:
+            return
+
+        owner_id = doc.get("owner_id")
+        doc_id = doc.get("id")
+        url = doc.get("url")
+        title = doc.get("title")
+        unique_key = (owner_id, doc_id, url, title)
+        if unique_key in seen_docs:
+            return
+
+        seen_docs.add(unique_key)
+        docs_found.append(doc)
+
+    def try_doc_ref(doc_ref, access_key=None):
+        doc_ref = _normalize_vk_doc_ref(doc_ref)
+        if not doc_ref:
+            return None
+
+        refs = []
+        if access_key and doc_ref.count("_") == 1:
+            refs.append(f"{doc_ref}_{access_key}")
+        refs.append(doc_ref)
+
+        for ref in refs:
+            if ref in checked_refs:
+                continue
+            checked_refs.add(ref)
+            doc = _get_doc_by_ref(vk, ref)
+            if doc and doc.get("url"):
+                return doc
+        return None
+
+    # Формат LongPoll: attach1_type=doc, attach1=owner_id_doc_id,
+    # attach2_type=doc, attach2=owner_id_doc_id и т.д.
+    # Иногда отдельно приходит attach1_access_key.
+    doc_prefixes = []
+    for key, value in attachments.items():
+        if key.endswith("_type") and value == "doc":
+            doc_prefixes.append(key[: -len("_type")])
+
+    doc_prefixes.sort(
+        key=lambda prefix: int(prefix.replace("attach", ""))
+        if prefix.replace("attach", "").isdigit()
+        else 9999
+    )
+
+    for prefix in doc_prefixes:
+        doc = try_doc_ref(
+            attachments.get(prefix),
+            attachments.get(f"{prefix}_access_key"),
+        )
+        add_doc(doc)
+
+    # Запасной вариант: в некоторых событиях значение уже приходит как doc123_456.
+    for value in attachments.values():
+        if isinstance(value, str) and "_" in value:
+            doc = try_doc_ref(value)
+            add_doc(doc)
+
+    # Ещё один запасной вариант: перечитываем сообщение через messages.getById.
+    # Там вложения часто приходят структурированно: {'type': 'doc', 'doc': {...}}.
+    message_id = getattr(event, "message_id", None)
+    if message_id:
+        try:
+            response = vk.messages.getById(message_ids=message_id)
+            items = response.get("items", []) if isinstance(response, dict) else []
+        except Exception as error:
+            print(f"Не удалось перечитать сообщение {message_id}: {error}")
+            items = []
+
+        for item in items:
+            for attachment in item.get("attachments", []):
+                if attachment.get("type") != "doc":
+                    continue
+
+                doc = attachment.get("doc") or {}
+                if doc.get("url"):
+                    add_doc(doc)
+                    continue
+
+                owner_id = doc.get("owner_id")
+                doc_id = doc.get("id")
+                access_key = doc.get("access_key")
+                if owner_id and doc_id:
+                    found_doc = try_doc_ref(f"{owner_id}_{doc_id}", access_key)
+                    add_doc(found_doc)
+
+    return docs_found
+
+
+def get_event_doc_info(vk, event):
+    """Оставлено для совместимости: возвращает первый документ из сообщения."""
+    docs = get_event_docs_info(vk, event)
+    return docs[0] if docs else None
 
 def download_vk_doc_to_folder(doc_info, folder_path):
     """Скачивает документ VK в выбранную папку cards."""
@@ -317,7 +843,7 @@ def download_vk_doc_to_folder(doc_info, folder_path):
     ext = os.path.splitext(title)[1].lower()
 
     if ext not in ALLOWED_CARD_EXTENSIONS:
-        raise ValueError("Можно загружать только .xlsx, .xls или .csv")
+        raise ValueError("Можно загружать только файлы .xlsx")
 
     os.makedirs(folder_path, exist_ok=True)
     target_path = ensure_safe_cards_path(os.path.join(folder_path, title))
@@ -333,7 +859,12 @@ def download_vk_doc_to_folder(doc_info, folder_path):
     if not url:
         raise ValueError("У документа нет ссылки для скачивания")
 
-    response = requests.get(url, timeout=30, stream=True)
+    response = requests.get(
+        url,
+        timeout=30,
+        stream=True,
+        headers={"User-Agent": "Mozilla/5.0"},
+    )
     response.raise_for_status()
 
     expected_size = int(response.headers.get("content-length") or 0)
@@ -374,25 +905,47 @@ def show_admin_menu(vk, user_id, admin_ids):
         vk,
         user_id,
         "⚙️ Административная панель\n\n"
-        "Здесь можно добавлять, удалять и обновлять техкарты.",
+        "Здесь можно добавлять и удалять техкарты, создавать и удалять папки, "
+        "скачивать все техкарты ZIP-архивом, а также смотреть пример оформления файла .xlsx.",
         keyboard=create_admin_keyboard(),
     )
 
 
 def start_admin_folder_choice(vk, user_id, mode):
-    """Запускает выбор папки для добавления или удаления файла."""
+    """Запускает выбор папки для добавления/удаления файла, создания или удаления папки."""
     admin_states[user_id] = {"mode": mode, "path": "cards"}
-    folders = get_subfolders("cards")
-    action = "загрузки новой техкарты" if mode == "upload" else "удаления техкарты"
+    folders = get_admin_subfolders("cards")
+    actions = {
+        "upload": "загрузки новой техкарты",
+        "delete": "удаления техкарты",
+        "create": "создания новой папки",
+        "delete_dir": "удаления папки",
+    }
+    action = actions.get(mode, "действия")
+
+    extra_text = ""
+    if mode == "create":
+        extra_text = "\n\nМожно создать папку прямо в cards или зайти внутрь нужного раздела."
+    elif mode == "delete_dir":
+        extra_text = (
+            "\n\nЗайдите в ненужную папку и нажмите «🗑 Удалить эту папку». "
+            "Папка удалится вместе со всеми файлами внутри после подтверждения."
+        )
+    elif mode == "upload":
+        extra_text = (
+            "\n\nПеред загрузкой .xlsx-файла проверьте формат через кнопку «📘 Как оформить техкарту» "
+            "в админке."
+        )
+
     send_msg(
         vk,
         user_id,
-        f"Выберите папку для {action}:",
+        f"Выберите папку для {action}:{extra_text}",
         keyboard=create_admin_folders_keyboard(folders, "cards", mode),
     )
 
 
-def handle_admin_state(vk, user_id, text, event, admin_ids):
+def handle_admin_state(vk, upload, user_id, text, event, admin_ids):
     """Обрабатывает многошаговые действия администратора."""
     state = admin_states.get(user_id)
     if not state:
@@ -411,7 +964,7 @@ def handle_admin_state(vk, user_id, text, event, admin_ids):
         else:
             new_path = os.path.dirname(current_path)
             state["path"] = new_path
-            folders = get_subfolders(new_path)
+            folders = get_admin_subfolders(new_path)
             send_msg(
                 vk,
                 user_id,
@@ -421,11 +974,13 @@ def handle_admin_state(vk, user_id, text, event, admin_ids):
         return True
 
     # Навигация по папкам внутри админки.
-    for folder in get_subfolders(current_path):
-        if text.lower() == folder.lower():
+    # Сравниваем и полное имя, и первые 40 символов: VK-кнопка может обрезать длинное название.
+    for folder in get_admin_subfolders(current_path):
+        folder_label = folder[:40]
+        if text.lower() in {folder.lower(), folder_label.lower()}:
             new_path = os.path.join(current_path, folder)
             state["path"] = new_path
-            folders = get_subfolders(new_path)
+            folders = get_admin_subfolders(new_path)
             send_msg(
                 vk,
                 user_id,
@@ -434,23 +989,27 @@ def handle_admin_state(vk, user_id, text, event, admin_ids):
             )
             return True
 
-    if mode == "upload":
-        if text == "✅ Выбрать эту папку":
-            state["mode"] = "upload_wait_file"
+    if mode == "create":
+        if text == "➕ Создать здесь":
+            state["mode"] = "create_wait_name"
             send_msg(
                 vk,
                 user_id,
-                f"Папка выбрана: {current_path}\n\n"
-                "Теперь отправьте сюда файл техкарты в формате .xlsx, .xls или .csv.",
+                f"Текущая папка: {current_path}\n\n"
+                "Напишите название новой папки. Например: Новые напитки",
                 keyboard=json.dumps(
                     {
                         "one_time": False,
                         "buttons": [
                             [
                                 {
+                                    "action": {"type": "text", "label": "⬅️ Админ назад"},
+                                    "color": "secondary",
+                                },
+                                {
                                     "action": {"type": "text", "label": "⚙️ Админка"},
                                     "color": "secondary",
-                                }
+                                },
                             ]
                         ],
                     },
@@ -459,28 +1018,170 @@ def handle_admin_state(vk, user_id, text, event, admin_ids):
             )
             return True
 
-    if mode == "upload_wait_file":
-        doc_info = get_event_doc_info(vk, event)
-        if not doc_info:
+    if mode == "create_wait_name":
+        try:
+            created_path = create_folder_in_cards(current_path, text)
+        except Exception as error:
             send_msg(
                 vk,
                 user_id,
-                "Пришлите файл документом VK: .xlsx, .xls или .csv.",
+                f"Не получилось создать папку: {error}\n\n"
+                "Напишите другое название или вернитесь в админку.",
             )
-            return True
-
-        try:
-            saved_path = download_vk_doc_to_folder(doc_info, current_path)
-        except Exception as error:
-            send_msg(vk, user_id, f"Не получилось сохранить файл: {error}")
             return True
 
         admin_states.pop(user_id, None)
         send_msg(
             vk,
             user_id,
-            f"✅ Техкарта добавлена:\n{saved_path}\n\n"
-            "Нажмите «🔄 Обновить базу», чтобы бот перечитал техкарты.",
+            f"✅ Папка создана:\n{created_path}\n\n"
+            "Теперь можно зайти в «➕ Добавить техкарту» и загрузить файл в эту папку.",
+            keyboard=create_admin_keyboard(),
+        )
+        return True
+
+    if mode == "delete_dir":
+        if text == "🗑 Удалить эту папку":
+            if current_path == "cards":
+                send_msg(vk, user_id, "Нельзя удалить корневую папку cards.")
+                return True
+
+            try:
+                files_count, dirs_count = get_folder_delete_summary(current_path)
+                folder_name = os.path.basename(current_path)
+            except Exception as error:
+                send_msg(vk, user_id, f"Не получилось проверить папку: {error}")
+                return True
+
+            state["mode"] = "delete_dir_confirm"
+            state["delete_dir_path"] = current_path
+            send_msg(
+                vk,
+                user_id,
+                f"Вы точно хотите удалить папку?\n\n"
+                f"📁 {folder_name}\n"
+                f"Внутри будет удалено: файлов — {files_count}, подпапок — {dirs_count}.\n\n"
+                "Это действие нельзя отменить.",
+                keyboard=json.dumps(
+                    {
+                        "one_time": False,
+                        "buttons": [
+                            [
+                                {
+                                    "action": {"type": "text", "label": "✅ Да, удалить папку"},
+                                    "color": "negative",
+                                }
+                            ],
+                            [
+                                {
+                                    "action": {"type": "text", "label": "⚙️ Админка"},
+                                    "color": "secondary",
+                                }
+                            ],
+                        ],
+                    },
+                    ensure_ascii=False,
+                ),
+            )
+            return True
+
+    if mode == "delete_dir_confirm":
+        if text != "✅ Да, удалить папку":
+            admin_states.pop(user_id, None)
+            send_msg(vk, user_id, "Удаление папки отменено.", keyboard=create_admin_keyboard())
+            return True
+
+        target_path = state.get("delete_dir_path")
+        try:
+            deleted_path = delete_folder_from_cards(target_path)
+            message = (
+                f"✅ Папка удалена:\n{os.path.basename(deleted_path)}\n\n"
+                "Нажмите «🔄 Обновить базу», чтобы бот перечитал техкарты."
+            )
+        except Exception as error:
+            message = f"Не получилось удалить папку: {error}"
+
+        admin_states.pop(user_id, None)
+        send_msg(vk, user_id, message, keyboard=create_admin_keyboard())
+        return True
+
+    if mode == "upload":
+        if text == "✅ Выбрать эту папку":
+            state["mode"] = "upload_wait_file"
+            upload_keyboard = json.dumps(
+                {
+                    "one_time": False,
+                    "buttons": [
+                        [
+                            {
+                                "action": {"type": "text", "label": "⚙️ Админка"},
+                                "color": "secondary",
+                            }
+                        ]
+                    ],
+                },
+                ensure_ascii=False,
+            )
+            send_msg(
+                vk,
+                user_id,
+                f"Папка выбрана: {current_path}\n\n"
+                "Теперь отправьте сюда один или несколько файлов техкарт в формате .xlsx.",
+                keyboard=upload_keyboard,
+            )
+            send_example_tech_card_file(vk, upload, user_id, keyboard=upload_keyboard)
+            return True
+
+    if mode == "upload_wait_file":
+        docs_info = get_event_docs_info(vk, event)
+        if not docs_info:
+            send_msg(
+                vk,
+                user_id,
+                "Пришлите один или несколько файлов документами VK в формате .xlsx.",
+            )
+            return True
+
+        saved_paths = []
+        errors = []
+        for doc_info in docs_info:
+            title = sanitize_filename(doc_info.get("title", "tech_card.xlsx"))
+            try:
+                saved_path = download_vk_doc_to_folder(doc_info, current_path)
+                saved_paths.append(saved_path)
+            except Exception as error:
+                errors.append(f"{title}: {error}")
+
+        if not saved_paths:
+            send_msg(
+                vk,
+                user_id,
+                "Не получилось сохранить ни один файл:\n" + "\n".join(errors[:10]),
+            )
+            return True
+
+        admin_states.pop(user_id, None)
+
+        saved_names = [os.path.basename(path) for path in saved_paths]
+        message = (
+            f"✅ Добавлено техкарт: {len(saved_paths)}\n"
+            + "\n".join(f"• {name}" for name in saved_names[:20])
+        )
+        if len(saved_names) > 20:
+            message += f"\n…и ещё {len(saved_names) - 20}"
+
+        if errors:
+            message += "\n\n⚠️ Не удалось сохранить некоторые файлы:\n"
+            message += "\n".join(f"• {error}" for error in errors[:10])
+            if len(errors) > 10:
+                message += f"\n…и ещё ошибок: {len(errors) - 10}"
+
+        message += "\n\nНажмите «🔄 Обновить базу», чтобы бот перечитал техкарты."
+
+        send_msg(
+            vk,
+            user_id,
+            message,
             keyboard=create_admin_keyboard(),
         )
         return True
@@ -494,7 +1195,7 @@ def handle_admin_state(vk, user_id, text, event, admin_ids):
                     user_id,
                     "В этой папке нет файлов техкарт.",
                     keyboard=create_admin_folders_keyboard(
-                        get_subfolders(current_path), current_path, mode
+                        get_admin_subfolders(current_path), current_path, mode
                     ),
                 )
                 return True
@@ -505,7 +1206,11 @@ def handle_admin_state(vk, user_id, text, event, admin_ids):
             message = (
                 f"Файлы в папке {current_path}:\n\n"
                 + "\n".join(lines)
-                + "\n\nНапишите номер файла для удаления, например: 2"
+                + "\n\nНапишите номера файлов для удаления:\n"
+                "• один файл: 2\n"
+                "• несколько файлов: 1, 3, 5\n"
+                "• диапазон: 1-4\n"
+                "• все файлы: все"
             )
             send_msg(
                 vk,
@@ -534,23 +1239,33 @@ def handle_admin_state(vk, user_id, text, event, admin_ids):
 
     if mode == "delete_choose_file":
         files = state.get("files", [])
-        if not text.isdigit():
-            send_msg(vk, user_id, "Напишите номер файла из списка.")
+        try:
+            selected_indexes = parse_file_selection(text, len(files))
+        except ValueError as error:
+            send_msg(vk, user_id, str(error))
             return True
 
-        index = int(text) - 1
-        if index < 0 or index >= len(files):
-            send_msg(vk, user_id, "Такого номера нет в списке.")
-            return True
+        selected_files = [files[index] for index in selected_indexes]
+        delete_paths = [
+            ensure_safe_cards_path(os.path.join(current_path, filename))
+            for filename in selected_files
+        ]
 
-        filename = files[index]
-        target_path = ensure_safe_cards_path(os.path.join(current_path, filename))
         state["mode"] = "delete_confirm"
-        state["delete_path"] = target_path
+        state["delete_paths"] = delete_paths
+
+        preview_lines = [f"• {filename}" for filename in selected_files[:30]]
+        message = (
+            f"Вы точно хотите удалить файлов: {len(selected_files)}?\n\n"
+            + "\n".join(preview_lines)
+        )
+        if len(selected_files) > 30:
+            message += f"\n…и ещё {len(selected_files) - 30}"
+
         send_msg(
             vk,
             user_id,
-            f"Вы точно хотите удалить файл?\n\n{filename}",
+            message,
             keyboard=json.dumps(
                 {
                     "one_time": False,
@@ -563,9 +1278,13 @@ def handle_admin_state(vk, user_id, text, event, admin_ids):
                         ],
                         [
                             {
+                                "action": {"type": "text", "label": "⬅️ Админ назад"},
+                                "color": "secondary",
+                            },
+                            {
                                 "action": {"type": "text", "label": "⚙️ Админка"},
                                 "color": "secondary",
-                            }
+                            },
                         ],
                     ],
                 },
@@ -580,20 +1299,49 @@ def handle_admin_state(vk, user_id, text, event, admin_ids):
             admin_states.pop(user_id, None)
             return True
 
-        target_path = state.get("delete_path")
-        try:
-            if target_path:
+        delete_paths = state.get("delete_paths")
+        if not delete_paths:
+            old_path = state.get("delete_path")
+            delete_paths = [old_path] if old_path else []
+
+        deleted = []
+        missing = []
+        errors = []
+
+        for target_path in delete_paths:
+            try:
                 target_path = ensure_safe_cards_path(target_path)
-            if target_path and os.path.exists(target_path):
-                os.remove(target_path)
-                message = (
-                    f"✅ Файл удалён:\n{os.path.basename(target_path)}\n\n"
-                    "Нажмите «🔄 Обновить базу», чтобы бот перечитал техкарты."
-                )
-            else:
-                message = "Файл уже не найден. Возможно, он был удалён раньше."
-        except Exception as error:
-            message = f"Не получилось удалить файл: {error}"
+                filename = os.path.basename(target_path)
+                if os.path.exists(target_path):
+                    os.remove(target_path)
+                    deleted.append(filename)
+                else:
+                    missing.append(filename)
+            except Exception as error:
+                errors.append(f"{os.path.basename(str(target_path))}: {error}")
+
+        if deleted:
+            message = (
+                f"✅ Удалено техкарт: {len(deleted)}\n"
+                + "\n".join(f"• {filename}" for filename in deleted[:30])
+            )
+            if len(deleted) > 30:
+                message += f"\n…и ещё {len(deleted) - 30}"
+            message += "\n\nНажмите «🔄 Обновить базу», чтобы бот перечитал техкарты."
+        else:
+            message = "Файлы не были удалены."
+
+        if missing:
+            message += "\n\n⚠️ Уже не найдены:\n"
+            message += "\n".join(f"• {filename}" for filename in missing[:10])
+            if len(missing) > 10:
+                message += f"\n…и ещё {len(missing) - 10}"
+
+        if errors:
+            message += "\n\n⚠️ Ошибки при удалении:\n"
+            message += "\n".join(f"• {error}" for error in errors[:10])
+            if len(errors) > 10:
+                message += f"\n…и ещё ошибок: {len(errors) - 10}"
 
         admin_states.pop(user_id, None)
         send_msg(vk, user_id, message, keyboard=create_admin_keyboard())
@@ -645,13 +1393,15 @@ def show_general_info(vk, upload, user_id, admin_ids):
     )
     send_msg(vk, user_id, message, keyboard=create_info_keyboard(user_id, admin_ids))
 
-    base_dir = os.path.dirname(os.path.abspath(__file__))
-    pdf_path = os.path.join(base_dir, "all_tech_cards.pdf")
+    # PDF со всеми техкартами храним вместе с файлами-примерами.
+    # Ожидаемый путь: tech_card_examples/all_tech_cards.pdf
+    os.makedirs(EXAMPLE_FILES_DIR, exist_ok=True)
+    pdf_path = os.path.join(EXAMPLE_FILES_DIR, "all_tech_cards.pdf")
     if not os.path.exists(pdf_path):
         send_msg(
             vk,
             user_id,
-            "PDF-файл пока не найден рядом с ботом. Проверьте, что файл all_tech_cards.pdf лежит в папке проекта.",
+            "PDF-файл пока не найден. Проверьте, что файл all_tech_cards.pdf лежит в папке tech_card_examples.",
             keyboard=create_info_keyboard(user_id, admin_ids),
         )
         return
@@ -676,7 +1426,7 @@ def show_general_info(vk, upload, user_id, admin_ids):
         send_msg(
             vk,
             user_id,
-            "Не получилось отправить PDF автоматически. Файл all_tech_cards.pdf лежит в папке проекта — его можно отправить вручную.",
+            "Не получилось отправить PDF автоматически. Файл all_tech_cards.pdf лежит в папке tech_card_examples — его можно отправить вручную.",
             keyboard=create_info_keyboard(user_id, admin_ids),
         )
 
@@ -1110,7 +1860,17 @@ def main():
                 continue
 
             # 1.1. АДМИН-КОМАНДЫ
-            if text in ["➕ Добавить техкарту", "🗑 Удалить техкарту", "📁 Папки техкарт", "🔄 Обновить базу", "👥 Список админов"]:
+            if text in [
+                "➕ Добавить техкарту",
+                "🗑 Удалить техкарту",
+                "📂 Создать папку",
+                "🗂 Удалить папку",
+                "📘 Как оформить техкарту",
+                "📁 Папки техкарт",
+                "📦 Скачать все техкарты ZIP",
+                "🔄 Обновить базу",
+                "👥 Список админов",
+            ]:
                 if not is_admin(user_id, admin_ids):
                     send_msg(vk, user_id, "Эта команда доступна только администратору.")
                     continue
@@ -1123,12 +1883,29 @@ def main():
                     start_admin_folder_choice(vk, user_id, "delete")
                     continue
 
+                if text == "📂 Создать папку":
+                    start_admin_folder_choice(vk, user_id, "create")
+                    continue
+
+                if text == "🗂 Удалить папку":
+                    start_admin_folder_choice(vk, user_id, "delete_dir")
+                    continue
+
+                if text == "📘 Как оформить техкарту":
+                    send_tech_card_format_help(vk, upload, user_id)
+                    continue
+
                 if text == "📁 Папки техкарт":
                     lines = get_folder_tree_lines("cards")
                     blocks = _split_text_blocks(lines, header="📁 Структура папок техкарт:")
                     for block in blocks[:-1]:
                         send_msg(vk, user_id, block)
                     send_msg(vk, user_id, blocks[-1], keyboard=create_admin_keyboard())
+                    continue
+
+                if text in {"📦 Скачать все техкарты ZIP", "📦 Скачать техкарты ZIP"}:
+                    send_msg(vk, user_id, "Собираю ZIP-архив техкарт, подождите немного...")
+                    send_cards_zip_archive(vk, upload, user_id)
                     continue
 
                 if text == "🔄 Обновить базу":
@@ -1151,7 +1928,7 @@ def main():
                     )
                     continue
 
-            if handle_admin_state(vk, user_id, text, event, admin_ids):
+            if handle_admin_state(vk, upload, user_id, text, event, admin_ids):
                 continue
 
             if text == "⬅️ К тестам":
